@@ -249,10 +249,7 @@ section[data-testid="stSidebar"] .stMarkdown { color: var(--smoke); }
 # ── Third-party imports ────────────────────────────────────────────────────────
 try:
     from groq import Groq
-    from langchain_community.document_loaders import PyPDFLoader, TextLoader
-    from langchain_community.vectorstores import Chroma
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from pypdf import PdfReader
     from docx import Document as DocxDocument
     from docx.shared import Pt, RGBColor
     from openpyxl import Workbook
@@ -321,46 +318,36 @@ def get_groq_client(api_key: str) -> Groq:
     return Groq(api_key=api_key)
 
 
-@st.cache_resource
-def get_embeddings():
-    return HuggingFaceEmbeddings(
-        model_name=EMBED_MODEL,
-        model_kwargs={"device": "cpu"},
-    )
+# ── Simple document processing (no LangChain needed) ─────────────────────────
+def extract_text_from_file(uploaded_file) -> str:
+    """Extract raw text from a PDF or text file."""
+    name = uploaded_file.name.lower()
+    if name.endswith(".pdf"):
+        reader = PdfReader(uploaded_file)
+        return "\n\n".join(
+            page.extract_text() or "" for page in reader.pages
+        )
+    else:
+        return uploaded_file.read().decode("utf-8", errors="ignore")
 
 
-# ── Helper: build vectorstore from uploaded files ─────────────────────────────
-def build_vectorstore(uploaded_files: list) -> "Chroma | None":
+def build_context_from_files(uploaded_files: list) -> str:
+    """Combine all uploaded files into a single context string, capped at
+    ~8000 chars so it fits comfortably in the prompt."""
     if not uploaded_files:
-        return None
-
-    all_docs = []
-    splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for f in uploaded_files:
-            path = Path(tmpdir) / f.name
-            path.write_bytes(f.read())
-            try:
-                if f.name.endswith(".pdf"):
-                    docs = PyPDFLoader(str(path)).load()
-                else:
-                    docs = TextLoader(str(path), encoding="utf-8").load()
-                all_docs.extend(splitter.split_documents(docs))
-            except Exception as e:
-                st.warning(f"Could not read {f.name}: {e}")
-
-    if not all_docs:
-        return None
-
-    return Chroma.from_documents(all_docs, get_embeddings())
+        return ""
+    parts = []
+    for f in uploaded_files:
+        text = extract_text_from_file(f)
+        parts.append(f"=== {f.name} ===\n{text.strip()}")
+    combined = "\n\n".join(parts)
+    # Trim to ~8000 chars to stay within token limits
+    return combined[:8000] if len(combined) > 8000 else combined
 
 
 def retrieve_context(store, query: str, k: int = 3) -> str:
-    if not store:
-        return "(no additional documents provided)"
-    docs = store.as_retriever(search_kwargs={"k": k}).invoke(query)
-    return "\n\n---\n\n".join(d.page_content for d in docs)
+    """Kept for compatibility — store is now just a string."""
+    return store if store else "(no additional documents provided)"
 
 
 # ── Helper: call Groq ─────────────────────────────────────────────────────────
@@ -549,9 +536,9 @@ with st.sidebar:
 
     if st.button("Index Documents", use_container_width=True):
         if uploaded_files:
-            with st.spinner("Building knowledge base..."):
-                st.session_state.vectorstore = build_vectorstore(uploaded_files)
-            st.success(f"Indexed {len(uploaded_files)} file(s)")
+            with st.spinner("Reading documents..."):
+                st.session_state.vectorstore = build_context_from_files(uploaded_files)
+            st.success(f"Loaded {len(uploaded_files)} file(s)")
         else:
             st.info("No files uploaded — will generate from intake only.")
 
@@ -669,11 +656,8 @@ with tab2:
                 client = get_groq_client(api_key)
 
                 with st.status("Generating strategy...", expanded=True) as status:
-                    st.write("📚 Retrieving client context...")
-                    store = st.session_state.vectorstore
-                    ctx_audience    = retrieve_context(store, "target audience pain points")
-                    ctx_competitors = retrieve_context(store, "competitor content gaps")
-                    ctx_offers      = retrieve_context(store, "services and offers")
+                    st.write("📚 Preparing client context...")
+                    doc_context = st.session_state.vectorstore or "(no additional documents provided)"
 
                     st.write("🧠 Calling Llama 3.1 on Groq...")
                     user_prompt = f"""
@@ -681,17 +665,9 @@ CLIENT INTAKE
 =============
 {st.session_state['intake_text']}
 
-RETRIEVED CONTEXT — AUDIENCE
-============================
-{ctx_audience}
-
-RETRIEVED CONTEXT — COMPETITORS
-================================
-{ctx_competitors}
-
-RETRIEVED CONTEXT — OFFERS
-===========================
-{ctx_offers}
+ADDITIONAL RESEARCH DOCUMENTS
+==============================
+{doc_context}
 
 Generate the JSON strategy package now.
 """.strip()
